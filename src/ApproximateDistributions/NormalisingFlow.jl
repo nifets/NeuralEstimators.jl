@@ -5,16 +5,16 @@ A normalising flow for amortised inference with a [`PosteriorEstimator`](@ref), 
 
 Normalising flows are diffeomorphisms (i.e., invertible, differentiable transformations with differentiable inverses) that map a simple base distribution (e.g., standard Gaussian) to a more complex target distribution (e.g., the posterior). They achieve this by applying a sequence of learned transformations, the forms of which are chosen to be invertible and allow for tractable density computation via the change of variables formula. This allows for efficient density evaluation during the training stage, and efficient sampling during the inference stage. For further details, see the reviews by [Kobyzev et al. (2020)](https://ieeexplore.ieee.org/document/9089305) and [Papamakarios (2021)](https://dl.acm.org/doi/abs/10.5555/3546258.3546315).
 
-`NormalisingFlow` uses affine coupling blocks (see [`AffineCouplingBlock`](@ref)), with optional activation normalisation ([`ActNorm`](@ref); [Kingma and Dhariwal, 2018](https://dl.acm.org/doi/10.5555/3327546.3327685)) and permutations applied between each block via [`CouplingLayer`](@ref). The base distribution is taken to be a standard multivariate Gaussian distribution.
+`NormalisingFlow` uses coupling blocks (by default, [`AffineCouplingBlock`](@ref)), with optional activation normalisation ([`ActNorm`](@ref); [Kingma and Dhariwal, 2018](https://dl.acm.org/doi/10.5555/3327546.3327685)) and permutations applied between each block via [`CouplingLayer`](@ref). The base distribution is taken to be a standard multivariate Gaussian distribution.
 
-When using a `NormalisingFlow` as the approximate distribution of a [`PosteriorEstimator`](@ref), the (learned) summary statistics are used to condition the affine coupling blocks at each layer. If `num_summaries = 0`, the flow is unconditional (e.g., when used in a [`PriorEstimator`](@ref)), which requires `d > 1`.
+When using a `NormalisingFlow` as the approximate distribution of a [`PosteriorEstimator`](@ref), the (learned) summary statistics are used to condition the coupling blocks at each layer. If `num_summaries = 0`, the flow is unconditional (e.g., when used in a [`PriorEstimator`](@ref)), which requires `d > 1`.
 
 !!! note
     To use `NormalisingFlow` with `Enzyme.jl`, set `adtype = AutoEnzyme(mode = set_runtime_activity(Enzyme.Reverse))` in [`train`](@ref).
 
 # Keyword arguments
 - `num_coupling_layers::Integer = 6`: number of coupling layers.
-- `kwargs`: additional keyword arguments passed to [`CouplingLayer`](@ref) and [`AffineCouplingBlock`](@ref).
+- `kwargs`: additional keyword arguments passed to [`CouplingLayer`](@ref) and its coupling blocks (e.g., `coupling`).
 """
 @concrete struct NormalisingFlow <: AbstractApproximateDistribution
     d
@@ -154,22 +154,25 @@ end
 # --------------------------------------------------------------------------
 
 """
-    CouplingLayer(d, num_summaries; use_act_norm = true, use_permutation = true, kwargs...)
+    CouplingLayer(d, num_summaries; coupling = AffineCouplingBlock, use_act_norm = true, use_permutation = true, kwargs...)
 
-A coupling layer used in a [`NormalisingFlow`](@ref), combining two
-[`AffineCouplingBlock`](@ref)s with optional activation normalisation and permutation.
+A coupling layer used in a [`NormalisingFlow`](@ref), combining two coupling blocks
+with optional activation normalisation and permutation.
 
 The layer splits its `d`-dimensional input into a lower half of dimension
 `d₁ = div(d, 2)` and an upper half of dimension `d₂ = d - d₁`. The two halves are then passed
-through a pair of affine coupling blocks in sequence: the first block transforms the lower
+through a pair of coupling blocks in sequence: the first block transforms the lower
 half conditioned on the upper, and the second block transforms the upper half conditioned on
-the already-transformed lower half. This ensures every component is updated in a single forward pass, unlike a standard coupling layer where one half is left unchanged. When `d` = 1, the layer reduces to a single affine transformation of the one component conditioned on the summary statistics.
-
-Optionally, activation normalisation ([`ActNorm`](@ref)) is applied before the coupling
-blocks, and a random [`Permutation`](@ref) is applied after.
+the already-transformed lower half. This ensures every component is updated in a single forward pass, unlike a standard coupling layer where one half is left unchanged. When `d` = 1, the layer reduces to a single coupling transformation of the one component conditioned on the summary statistics.
 
 The argument `num_summaries` is the dimension of the conditioning summary statistics
-(see [`PosteriorEstimator`](@ref)) and `kwargs` are passed to [`AffineCouplingBlock`](@ref).
+(see [`PosteriorEstimator`](@ref)).
+
+# Keyword arguments
+- `coupling = AffineCouplingBlock`: the coupling block type (see [`AffineCouplingBlock`](@ref)).
+- `use_act_norm = true`: whether to apply activation normalisation ([`ActNorm`](@ref)).
+- `use_permutation = true`: whether to apply a random [`Permutation`](@ref).
+- `kwargs`: passed to `coupling`.
 """
 @concrete struct CouplingLayer
     d
@@ -184,14 +187,15 @@ end
 function CouplingLayer(
     d::Integer,
     num_summaries::Integer;
+    coupling = AffineCouplingBlock,
     use_act_norm::Bool = true,
     use_permutation::Bool = true,
     kwargs...
 )
     d₁ = div(d, 2)
     d₂ = d - d₁
-    block1 = d > 1 ? AffineCouplingBlock(d₂, num_summaries, d₁; kwargs...) : nothing
-    block2 = AffineCouplingBlock(d₁, num_summaries, d₂; kwargs...)
+    block1 = d > 1 ? coupling(d₂, num_summaries, d₁; kwargs...) : nothing
+    block2 = coupling(d₁, num_summaries, d₂; kwargs...)
     actnorm = use_act_norm ? ActNorm(d) : nothing
     permutation = (use_permutation && d > 1) ? Permutation(d) : nothing
     CouplingLayer(d, d₁, d₂, block1, block2, actnorm, permutation)
@@ -295,6 +299,8 @@ end
 # AffineCouplingBlock
 # --------------------------------------------------------------------------
 
+abstract type AbstractCouplingBlock end
+
 @doc raw"""
     AffineCouplingBlock(κ₁::MLP, κ₂::MLP)
     AffineCouplingBlock(d₁::Integer, num_summaries::Integer, d₂; kwargs...)
@@ -317,7 +323,7 @@ where $c = 1.9$ is a fixed clamping threshold. This transformation ensures that 
 
 Additional keyword arguments `kwargs` are passed to the [`MLP`](@ref) constructor when creating `κ₁` and `κ₂`. 
 """
-struct AffineCouplingBlock{M, D}
+struct AffineCouplingBlock{M, D} <: AbstractCouplingBlock
     scale::M
     translate::M
     d₁::D
